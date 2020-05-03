@@ -130,7 +130,6 @@ uint16_t color_increase(uint16_t color)
             r++;
     }
     */
-    /*
     if (g == green_max) 
     {
         r++;
@@ -139,7 +138,7 @@ uint16_t color_increase(uint16_t color)
     {
         g++;
     }
-    */
+    /*
     if (r == red_max) 
     {
         g++;
@@ -148,6 +147,7 @@ uint16_t color_increase(uint16_t color)
     {
         r++;
     }
+    */
 
     /*
     uint8_t step = 1;
@@ -258,6 +258,7 @@ int init_data_from_file()
     }
         
     logfile_pos = ftell(f);
+    fclose(f);
     
     /* old version, reading from the end of the file 
        
@@ -667,6 +668,8 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
     uint16_t len_y = height-(height/10*2);
     */
 
+    //printf("drawg: %u %u %u %u      %u %u %u %u\n", x,y,width,height,poo_x,poo_y,len_x,len_y);
+
     uint32_t val_min;
     uint32_t val_max;
     uint32_t val_range;
@@ -765,7 +768,7 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         }
 
         // blacken graph area
-        fillRect(poo_x + 1, poo_y + 1, len_x - 1, len_y - 1, ILI9341_BLACK);//WHITE);
+        //fillRect(poo_x + 1, poo_y + 1, len_x - 1, len_y - 1, ILI9341_BLACK);//WHITE);
     }
     else
     {
@@ -878,15 +881,24 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
     {
         float rel_pos = (float) (gc->get_val_func((start_index + i) % GRAPH_BUF_LEN) - val_min) / 
                                     val_range;
-        float tmp = rel_pos * len_y;
+        float tmp = rel_pos * (len_y - 1);  // there are len_y - 1 pixel above the x axis
         uint16_t y = roundf(tmp*10.0f)/10.0f;
 
+
+        // color gradient
+        if (i % 4 == 0) c = color_increase(c);
+
+        // blacken current column
+        fillRect(i + poo_x + 1, poo_y + 1, 1, len_y - 1, ILI9341_BLACK);//WHITE);
+
+        /*
         if (!i) writePixel(i + poo_x + 1, y + poo_y, c);
 
         if (i)  // skip for first drawn value
         {
             int16_t diff = (int16_t) y - prev_y;
             int8_t lost_pixel = diff % 2 ? 1 : 0; // if diff is odd, this makes one line longer than the other
+            //diff = 0;
             if (diff > 1) 
             {
                 // connect pixels by drawing a vertical line between them;
@@ -917,16 +929,16 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
             } else
             {
                 writePixel(i + poo_x + 1, y + poo_y, c);
+                //printf("drawg: y abs: %d\n", y + poo_y);
             } 
         }
         prev_y = y;
-
+        */
 
         // TODO if using different colors for the graphs y values along the x axis, then colors in the same column differ slightly
         // but not noticable with smooth gradients ;)
        
-        // TODO divide drawing of the static axis and of the graph, so that the graph can be separately redrawn when
-        // new data becomes available
+        fillRect(i + poo_x + 1, poo_y + 1, 1, y - 1, c);//WHITE);
 
         //writePixel(i + poo_x + 1, y + poo_y, color);
 
@@ -934,8 +946,6 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         //uint16_t y_floor = floorf(y);
         //if (i %  (int16_t)ceilf(((float)pixel_number / 63)) == 0) color = color_increase(color);
         //if (i %  (int16_t)ceilf(((float)pixel_number / 94)) == 0) c = color_increase(c);
-        if (i % 4 == 0) c = color_increase(c);
-        fillRect(i + poo_x + 1, poo_y + 1, 1, y - 1, c);//WHITE);
         //color += 100;
         //printf("color: 0x%04x\n", color);
         //writePixel(i + poo_x + 1, y_floor + poo_y, color);
@@ -1086,7 +1096,7 @@ void init_inotify()
 void screen_draw(uint8_t flag_update)
 {
     // start drawing on the displays
-    uint16_t fg_color = ILI9341_RED;
+    uint16_t fg_color = ILI9341_GREEN;
     uint16_t bg_color = ILI9341_BLACK;
 
     // TODO:
