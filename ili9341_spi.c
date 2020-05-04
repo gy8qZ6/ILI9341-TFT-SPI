@@ -39,24 +39,18 @@
  *
  */
 
-// TODO kick unused libraries
-#include <stdio.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
-#include <linux/types.h>
 #include <linux/spi/spidev.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 #include <bcm2835.h>
-// TODO: include .c???
 
 #include "ili9341_spi.h"
-#include "glcdfont.c"
+#include "glcdfont.h"
 
 #define ILI9341_SPI_DC_LOW() bcm2835_gpio_write(_dc_pin, LOW)// Command mode
 #define ILI9341_SPI_DC_HIGH() bcm2835_gpio_write(_dc_pin, HIGH)// Data mode
