@@ -1,15 +1,4 @@
-/*
-* Sample application that makes use of the SPIDEV interface
-* to access an SPI slave device. Specifically, this sample
-* reads a Device ID of a JEDEC-compliant SPI Flash device.
-*/
-
-
-/* TODO: use hardware chip selects */
-
-/* TODO: use inotify to monitor BME280.log, remember fileposition of last line with ftell()
-         and read new data starting from the first new line after that
-         Then redraw the graphs */
+/* TODO: try to use hardware chip selects */
 
 #include <stdio.h>
 #include <sys/types.h>
@@ -48,29 +37,28 @@ the timestamp (0 - 60) by this value
 #define DATA_INTERVAL_MINUTES 15 
 #define GRAPH_XAXIS_MARK_INTERVAL 12*60 // 12hours
 
-
+// read sensor data from this file
 #define LOG_FILE "/home/pi/driver_dev/SPI/BME280.log"
 #define GRAPH_BUF_LEN 300 // length of ring buffer for sensor values == length of x axis in pixels
-//#define READ_LEN  500
 
-// inotify
+// inotify to watch LOG_FILE
 #define EVENT_SIZE  ( sizeof (struct inotify_event) )
 #define EVENT_BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
 
-#define READ(x) x | 1 << 7
-#define BME280_REG_ID 0xD0
 
-//extern const unsigned char font[];
+// holds configuration values for function drawGraph
 struct graph_config
 {
     char type;
-    uint32_t min;
+    uint32_t min;       // draw y-axis from current minimum to maximum sensor value
     uint32_t max;
-    uint32_t mark_big;
-    uint32_t mark_small;
-    uint32_t (*get_val_func)(uint16_t);
+    uint32_t mark_big;  // big mark interval on y-axis
+    uint32_t mark_small;    // small mark interval on y-axis
+    uint32_t (*get_val_func)(uint16_t); // function pointer to either get T,P, or H sensor values
+                                        // from the ringbuffer
 };
 struct graph_config temp = {
+    .type = 'T',
     .min = -1,
     .max = 0,
     .mark_big = 100,
@@ -78,6 +66,7 @@ struct graph_config temp = {
     .get_val_func = &get_temp
 };   
 struct graph_config pres = {
+    .type = 'P',
     .min = -1,
     .max = 0,
     .mark_big = 100,
@@ -85,6 +74,7 @@ struct graph_config pres = {
     .get_val_func = &get_press
 };   
 struct graph_config hum = {
+    .type = 'H',
     .min = -1,
     .max = 0,
     .mark_big = 500,
@@ -102,17 +92,20 @@ int fd_inotify;
 int wd_inotify;
 uint64_t logfile_pos = 0;
 
+// ringbuffer for sensor values
+// one ringbuffer element stores sensor value for all three types
+// NOTE: we don't store the timestamp from the logfile in the ringbuffer
 struct sensor_vals {
-    // all sensor values in * 100 instead of floats
+    // all sensor values in integers * 100 instead of floats
     uint16_t temp;
     uint16_t hum;
     uint32_t press;
-    // TODO timestamp
 };
 struct sensor_vals *values;
 uint16_t rb_read_index = 0, rb_write_index = 0;
 
-
+// have some fun with graph drawing
+// make a color gradient over the entire graph
 /* color is 16bit of RGB with R:5 G:6 B:5 bits each */
 uint16_t color_increase(uint16_t color)
 {
@@ -123,6 +116,17 @@ uint16_t color_increase(uint16_t color)
     uint8_t g = color >> 5 & 0x003f; // 111111
     uint8_t r = color >> 11;
 
+    // gives gradient from black to light green
+    // first increase green color intensity, then red
+    if (g != green_max) 
+    {
+        g++;
+    } 
+    else
+    {
+        r++;
+    }
+
     /*
     if ((b++) > blue_max)
     {
@@ -130,14 +134,6 @@ uint16_t color_increase(uint16_t color)
             r++;
     }
     */
-    if (g == green_max) 
-    {
-        r++;
-    } 
-    else
-    {
-        g++;
-    }
     /*
     if (r == red_max) 
     {
@@ -166,27 +162,35 @@ uint16_t color_increase(uint16_t color)
     return color;
 }
 
+/*
+ * convert str to integer
+ * used to read values from CSV logfile
+ * implemented this for fun instead of using the standard atoi()
+ *
+ * param:   takes pointer to pointer of string value in logfile line
+ * returns: value as an integer
+ *          and s now points to the next value in the source string
+ */
 uint32_t str_to_int(char **s)
 {
     uint32_t res = 0;
     char c;
-    //printf("%s\n", *s);
-    //exit(1);
+    
     while ((c = *(*s)++) != ',' && c != '\n' && c != ':')
     {
-        //(*s)++;
-        if (c == '.') continue;
-        res = res * 10 + (c & 0x0F); //- 0x30);
+        // read in float value as integer by ignoring decimal point
+        // used only on float strings with two decimal places (i.e. 13.xy),
+        // so int32 can hold the value
+        if (c == '.') continue;  
+        // convert ASCII char into digit and append to our integer value
+        res = res * 10 + (c & 0x0F);
     }
     return res;
 }
 
-
-// TODO implement as ringbuffer,
-// as new data is measured, discard old
-// data that goes off screen
-
-/* read stored data from a file at program start */
+/* read stored data from a file at program start into ringbuffer
+ * update ringbuffer with new data on subsequent calls
+ */
 int init_data_from_file()
 {
     int16_t no_lines = 0;
@@ -216,26 +220,20 @@ int init_data_from_file()
     struct sensor_vals *ptr = values;
     while (fgets(line, sizeof line, f))
     {
-        // get minute value of timestamp
-        
-        if (logfile_pos != 0) printf("read: %s\n", line);
         
         char *sep = strchr(line, ':') + 1; // point sep to minute 
         uint8_t minute = (uint8_t) str_to_int(&sep); // sep now points to seconds value
         sep = strchr(sep, ',') + 1; // point sep to first sensor value
 
-        //printf("minute: %d\n", minute);
-        
+        // only read values fitting our intervals from log file
         if (minute % DATA_INTERVAL_MINUTES) continue;
+
+        // output new measured values
+        if (logfile_pos != 0) printf("read: %s\n", line);
 
         uint16_t temp = str_to_int(&sep);
         uint32_t press = str_to_int(&sep);
         uint16_t hum = str_to_int(&sep);
-
-        //###################################################
-        // TODO ring buffer implementation will get tested
-        // only after we implement adding live data!!
-        //###################################################
 
         // TODO: do proper interface for ringbuffer?
 
@@ -257,37 +255,13 @@ int init_data_from_file()
         
     }
         
+    // save current position so we can start reading logfile from here
+    // on the next screen update
     logfile_pos = ftell(f);
     fclose(f);
-    
-    /* old version, reading from the end of the file 
-       
-    if (fseek(f, 0, SEEK_END))
-    {
-        perror("error");
-        exit(1);
-    }
-
-
-    uint64_t pos = ftell(f);
-    while (pos)
-    {
-        fseek(f, pos--, SEEK_SET);
-        if (fgetc(f) == '\n')
-        {
-            // control how far back we read in data
-            if (no_lines++ == GRAPH_BUF_LEN*12)
-            {
-                break;
-            }
-        }
-    }
-    */
 }
 
-/* write new datum to file */
-//int data_write(int fd, struct *sensor_vals);
-
+// initialization commands for ILI9341 Display
 static const uint8_t initcmd[] = {
   0xEF, 3, 0x03, 0x80, 0x02,
   0xCF, 3, 0x00, 0xC1, 0x30,
@@ -316,6 +290,9 @@ static const uint8_t initcmd[] = {
   0x00                                   // End of list
 };
 
+// send command + optional arguments to ILI9341
+// TODO use write and read operations instead of ioctl
+//      because we are not using the advanced functionality here
 int sendCommand(uint8_t cmd, const uint8_t *addr, uint8_t numArgs)
 {
     struct spi_ioc_transfer xfer[1];
@@ -324,6 +301,8 @@ int sendCommand(uint8_t cmd, const uint8_t *addr, uint8_t numArgs)
     xfer[0].len = 1;
     //xfer[0].cs_change = 0;
 	//bcm2835_gpio_write(cs_pin, LOW);
+
+    // send command with activated Data/Control bit
 	bcm2835_gpio_write(dc_pin, LOW);
     uint8_t status = ioctl(fd, SPI_IOC_MESSAGE(1), xfer);
     if (status < 0) {
@@ -334,7 +313,7 @@ int sendCommand(uint8_t cmd, const uint8_t *addr, uint8_t numArgs)
     }
 	bcm2835_gpio_write(dc_pin, HIGH);
 
-    // don't send if we have nothing to send
+    // send Command Arguments if we have any
     if (numArgs)
     {
         xfer[0].tx_buf = (unsigned long) addr;
@@ -352,6 +331,7 @@ int sendCommand(uint8_t cmd, const uint8_t *addr, uint8_t numArgs)
 	//bcm2835_gpio_write(cs_pin, HIGH);
 }
 
+// initialize ILI9341 Display
 void begin()
 {
   uint8_t cmd, x, numArgs;
@@ -382,93 +362,44 @@ void begin()
 
 #define TEST_RST_LOW() bcm2835_gpio_write(rst_pin, LOW)
 #define TEST_RST_HIGH() bcm2835_gpio_write(rst_pin, HIGH)
-/* original pulls CS low and calls BEGIN_TRANSACTION,
-    setting up SPI on the rPi
-*/
-/*
-void startWrite()
-{
-    TEST_SPI_CS_LOW();
-}
-oppsite of startWrite
-void endWrite()
-{
-    TEST_SPI_CS_HIGH();
-}
-void startWrite2()
-{
-    TEST_SPI_CS2_LOW();
-}
-// oppsite of startWrite
-void endWrite2()
-{
-    TEST_SPI_CS2_HIGH();
-}
-*/
 
+// send a command to ILI9341 that receives a 1Byte answer
 uint8_t readcommand8(uint8_t commandByte)//, uint8_t index) {
 {
   uint8_t result;
-  //startWrite();
+
   TEST_SPI_DC_LOW(); // Command mode
-    
-  //spiWrite(commandByte); // just write 1byte on SPI
   write(fd, &commandByte, 1);
-        
   TEST_SPI_DC_HIGH(); // Data mode
-  //do {
-    //result = spiRead();
-    read(fd, &result, 1);
-  //} while (index--); // Discard bytes up to index'th
-  //endWrite();
+
+  read(fd, &result, 1);
   return result;
 }
 
-/*
-uint8_t readcommand82(uint8_t commandByte)//, uint8_t index) {
-{
-  uint8_t result;
-  //startWrite2();
-  TEST_SPI_DC_LOW(); // Command mode
-    
-  //spiWrite(commandByte); // just write 1byte on SPI
-  write(fd, &commandByte, 1);
-        
-  TEST_SPI_DC_HIGH(); // Data mode
-  //do {
-    //result = spiRead();
-    read(fd, &result, 1);
-  //} while (index--); // Discard bytes up to index'th
-  //endWrite2();
-  return result;
-}
-*/
-
+// send 1 Byte to ILI9341
 void SPI_WRITE8(uint8_t value)
 {
     write(fd, &value, 1);
 }
+
+// send 2 Bytes to ILI9341
 void SPI_WRITE16(uint16_t value)
 {
-    //printf("SPIWRITE16: val: %i\n", value);
     uint8_t msb = value >> 8; 
     uint8_t lsb = (uint8_t)value; 
-    //uint8_t lsb = value; 
-    //printf("SPIWRITE16: val: %i msb: %i lsb: %i\n", value, msb, lsb);
     write(fd, &msb, 1);
     write(fd, &lsb, 1);
 }
+
+// send 1Byte command to ILI9341
 void writeCommand(uint8_t cmd)
 {
     TEST_SPI_DC_LOW();
     SPI_WRITE8(cmd);
     TEST_SPI_DC_HIGH();
-    /*
-    TEST_SPI_CS_HIGH();
-    TEST_SPI_CS_LOW();
-    */
 }
     
+// set up a pixel drawing area on the display
 void setAddrWindow(uint16_t x1, uint16_t y1, uint16_t w,
                                      uint16_t h) {
   uint16_t x2 = (x1 + w - 1), y2 = (y1 + h - 1);
@@ -481,6 +412,7 @@ void setAddrWindow(uint16_t x1, uint16_t y1, uint16_t w,
   writeCommand(ILI9341_RAMWR); // Write to RAM
 }
 
+// control one pixel
 void writePixel(int16_t x, int16_t y, uint16_t color) {
   if ((x >= 0) && (x < _width) && (y >= 0) && (y < _height)) {
     setAddrWindow(x, y, 1, 1);
@@ -488,18 +420,14 @@ void writePixel(int16_t x, int16_t y, uint16_t color) {
   }
 }
 
+// color pixels that where defined by setAddrWindow() before
+// we have to send the color value for each pixel individually
+// that means we just send the same color value repeatedly here
+// if we want to color an area
 int writeColor(uint16_t color, uint32_t len) 
 {
     if (!len)
         return 0; // Avoid 0-byte transfers
-
-  // All other cases (non-DMA hard SPI, bitbang SPI, parallel)...
-    /*
-  while (len--) {
-    SPI_WRITE8(hi);
-    SPI_WRITE8(lo);
-  }
-*/
 
     // max buf len per ioctl call is 2048
     int max_len = 2048;
@@ -519,43 +447,10 @@ int writeColor(uint16_t color, uint32_t len)
     }
     write(fd, buf, (len % max_len)*2);
 
-    /*
-    uint8_t status;
-    struct spi_ioc_transfer xfer[1];
-    memset(xfer, 0, sizeof xfer);
-    xfer[0].tx_buf = (unsigned long)buf;
-    xfer[0].len = max_len*2;
-    //xfer[0].tx_buf = (unsigned long)buf;
-    //xfer[0].len = 2048;
-    //xfer[0].cs_change = 0;
-    // TODO pull DC Pin down
-    int iterations = len / max_len;
-    while (iterations--) {
-        status = ioctl(fd, SPI_IOC_MESSAGE(1), xfer);
-        if (status < 0) {
-            printf("error\n");
-            perror("SPI_IOC_MESSAGE");
-            bcm2835_close();
-            free(buf);
-            return 1;
-        }
-    }
-    //xfer[0].tx_buf = (unsigned long)buf;
-    xfer[0].len = (len % max_len) * 2;
-    //xfer[0].cs_change = 0;
-    // TODO pull DC Pin down
-    status = ioctl(fd, SPI_IOC_MESSAGE(1), xfer);
-    if (status < 0) {
-        printf("error\n");
-        perror("SPI_IOC_MESSAGE");
-        bcm2835_close();
-        free(buf);
-        return 1;
-    }
-    */
     free(buf);
 }
 
+// draw a filled rectangle
 void fillRect(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t color)
 {
   if ((x >= 0) && (x < _width) && (y >= 0) && (y < _height)) {
@@ -566,6 +461,7 @@ void fillRect(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t co
   }
 }
 
+// invert the colors of the whole display
 void invert(uint8_t mode)
 {
     TEST_SPI_DC_LOW();
@@ -579,6 +475,7 @@ void invert(uint8_t mode)
     TEST_SPI_DC_HIGH();
 }
 
+// draw an ASCII char on the display
 void drawChar(int16_t x, int16_t y, unsigned char c,
                           uint16_t color, uint16_t bg, uint8_t size_x,
                           uint8_t size_y) {
@@ -593,7 +490,6 @@ void drawChar(int16_t x, int16_t y, unsigned char c,
   if (c >= 176)
     c++; // Handle 'classic' charset behavior
 
-  //startWrite();
   for (int8_t i = 0; i < 5; i++) { // Char bitmap = 5 columns
     uint8_t line = font[c * 5 + i];//pgm_read_byte(&font[c * 5 + i]);
     for (int8_t j = 7; j >= 0; j--, line >>= 1) {
@@ -619,11 +515,9 @@ void drawChar(int16_t x, int16_t y, unsigned char c,
     else
       fillRect(x + 5 * size_x, y, size_x, 8 * size_y, bg);
   }
-  //endWrite();
-
 }
 
-
+// functions to retrieve sensor values from ringbuffer element
 uint32_t get_temp(uint16_t index)
 {
     return values[index].temp;
@@ -636,6 +530,7 @@ uint32_t get_hum(uint16_t index)
 {
     return values[index].hum;
 }
+
 /* draw both axis and graph for one sensor value */
 void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
                struct graph_config* gc, uint16_t color, uint8_t flag_update)
@@ -647,13 +542,6 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         return;
     }
 
-    // point_of_origin_x
-    /*
-    uint16_t poo_x = x + width/10;
-    uint16_t poo_y = y + width/10;
-    uint16_t len_x = width/10*9;
-    uint16_t len_y = height-(height/10*2);
-    */
     // poo coordinates are absolute to the whole screen!!
     uint16_t poo_x = x + width/9;
     uint16_t poo_y = y + height/8;
@@ -661,61 +549,17 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
     uint16_t len_x = width - width/9;//poo_x;//width*8/9;
     //uint16_t len_y = height-(height/10*2);
     uint16_t len_y = height - height/8;//poo_y - 10;
-    /*
-    uint16_t poo_x = x + width/15;
-    uint16_t poo_y = y + height/20;
-    uint16_t len_x = width*14/15;
-    uint16_t len_y = height-(height/10*2);
-    */
 
     //printf("drawg: %u %u %u %u      %u %u %u %u\n", x,y,width,height,poo_x,poo_y,len_x,len_y);
 
     uint32_t val_min;
     uint32_t val_max;
     uint32_t val_range;
-    //uint32_t mark_big;
-    //uint32_t mark_small;
-    //uint32_t (*get_val_func)(uint16_t);
 
-
-    /*
-    switch (type)
-    {
-        case 'T':
-            // temps in Celsius*100
-//          val_min = 2050;
-//          val_max = 2250;
-            mark_big = 100;
-            mark_small = 50;
-            get_val_func = &get_temp;
-            break;
-        case 'P':
-            // temps in Celsius*100
-//          val_min = 99020;
-//          val_max = 99400;
-            mark_big = 100;
-            mark_small = 50;
-            get_val_func = &get_press;
-            break;
-        case 'H':
-        default:
-            // temps in Celsius*100
-//          val_min = 3000;
-//          val_max = 4500;
-            mark_big = 500;
-            mark_small = 250;
-            get_val_func = &get_hum;
-    }
-    */
-
-
-    // len_x now represents amount of pixels to draw (don't draw on the y axis)
-    //len_x--;
+    // we have this many pixels to draw for the graph (don't draw on the y axis)
     int16_t pixel_number = len_x - 1;
 
-    // graph as many sensor values as the x axis is pixels wide (len_x)
     // values[rb_write_index] is unused, last value is values[rb_write_index-1]
-
     // calculate starting index in ringbuffer values
     int16_t start_index = rb_write_index - pixel_number;
     //start_index = start_index < 0 ? GRAPH_BUF_LEN + start_index : start_index;
@@ -726,16 +570,11 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
     val_min = -1; // biggest unsigned int value
     val_max = 0; // lowest unsigned int value
     //printf("init: val_min: %u val_max: %u\n", val_min, val_max);
+
     for (int i = 0; i < pixel_number; i++)
     {
-        // find min and max of value
+        // find min and max of sensor value
         uint32_t val = gc->get_val_func((start_index + i) % GRAPH_BUF_LEN);
-        /*
-        if (type == 'P')
-        {
-            printf("val: %d\n", val);
-        }
-        */
         if (val < val_min) 
         {
             val_min = val;
@@ -744,31 +583,24 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         {
             val_max = val;
         }
-        /*
-        if (type == 'P')
-        {
-            printf("val_min: %d val_max: %d\n", val_min, val_max);
-        }
-        */
     }
 
     val_range = val_max - val_min;
     //printf("max: %i min: %i\n", val_max, val_min);
     
     uint8_t flag_redraw_y = 0;
+
+    // avoid redrawing of coordinate systems x and y axis if we are only updating the graph
     if (flag_update)
     {
         // compare with old val_min and val_max values to see if we need to redraw 
         // the y axis
         if (val_max != gc->max || val_min != gc->min)
         {
-            // blacken and redraw y axis
+            // blacken y axis marks
             fillRect(x, y, width/9, height, ILI9341_BLACK);//WHITE);
             flag_redraw_y = 1;
         }
-
-        // blacken graph area
-        //fillRect(poo_x + 1, poo_y + 1, len_x - 1, len_y - 1, ILI9341_BLACK);//WHITE);
     }
     else
     {
@@ -785,6 +617,7 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         // draw mark every 12h: 12 * 60 / 15 = 48 pixel, counted from the very right
         uint16_t pixel_step = GRAPH_XAXIS_MARK_INTERVAL / DATA_INTERVAL_MINUTES;
 
+        // draw x axis marks and annotations 
         for (int16_t k = 0; k <= len_x / pixel_step; k++ )
         {
             fillRect(width - 1 - k * pixel_step, poo_y - 5, 1, 5, color);//WHITE);
@@ -817,12 +650,11 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
     gc->max = val_max;
     gc->min = val_min;
 
+    // draw marks on y axis
     if (!flag_update || flag_redraw_y)
     {
-    
-        // draw marks on y axis for every half degree Celsius,
         // but not at the point of origin
-        // complex because resizes depending on val_min & val_max!
+        // complex because resizing depends on val_min & val_max!
         uint16_t rest = gc->mark_small - (val_min % gc->mark_small);
         uint8_t number_of_marks = (val_max - (val_min + rest)) / gc->mark_small + (val_min % gc->mark_small?1:0);
         for (uint8_t i = 0; i < number_of_marks; i++) 
@@ -831,6 +663,8 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
             float rel_mark_pos = (float)tmp / val_range;
             uint32_t mark_val = val_min + rest + i * gc->mark_small;
             //printf("mark val: %d\n", mark_val);
+            
+            // draw small or big mark
             uint8_t length_div = mark_val % gc->mark_big ? 8 : 4;
 
             //uint16_t mark_x = poo_x - width/10/length_div;
@@ -838,26 +672,19 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
             uint16_t mark_y = poo_y + (int16_t)(len_y * rel_mark_pos);
             uint16_t mark_w = (width - len_x)/length_div;
             fillRect(mark_x, mark_y, mark_w, 1, color);//WHITE);
+
+            // annotate big marks with value string
             if (length_div == 4) 
             {
-                //printf("mark_val: %d\n", mark_val);
                 mark_val /= 100;
-                //printf("mark_val: %d\n", mark_val);
-                /*
-                i = 0;
-                do {
-                    drawChar((int16_t)x + i * 5, (int16_t)mark_y - 3, mark_val % 10 | 0x30, ILI9341_WHITE, ILI9341_BLACK, 1, 1);
-                    i++;
-                } while (mark_val /= 10);
-                */
 
                 char mark_str[10];
                 
+                // use own itoa()-like implementation instead of sprintf ;)
                 int8_t k;
                 for (k = 0; mark_val; mark_val /= 10, k++)
                 {
                     mark_str[k] = mark_val % 10 | 0x30;
-            //        printf("%c", mark_str[k]);
                 }
                 int8_t j = 0;
                 for (k -=1; k >= 0; k--,j++)
@@ -865,16 +692,15 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
                     uint16_t char_x = mark_x - 6;// = poo_x - (width - len_x)/length_div;
                     //drawChar((int16_t)x + k * 6, (int16_t)mark_y - 3, mark_str[j], ILI9341_WHITE, ILI9341_BLACK, 1, 1);
                     drawChar(char_x - j * 6, (int16_t)mark_y - 3, mark_str[j], color, ILI9341_BLACK, 1, 1);
-                    //sleep(1);
                 }
             }
                 
-            //sleep(1);
         }
     }
 
     uint16_t prev_y = 0;
     
+    // starting color for graph gradient
     uint16_t c = ILI9341_BLACK;
 
     for (int i = 0; i < pixel_number; i++)
@@ -884,7 +710,6 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         float tmp = rel_pos * (len_y - 1);  // there are len_y - 1 pixel above the x axis
         uint16_t y = roundf(tmp*10.0f)/10.0f;
 
-
         // color gradient
         if (i % 4 == 0) c = color_increase(c);
 
@@ -892,6 +717,9 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         fillRect(i + poo_x + 1, poo_y + 1, 1, len_y - 1, ILI9341_BLACK);//WHITE);
 
         /*
+         * if we decide to switch back to line only graphs, then use this to get
+         * unbroken graph lines:
+        
         if (!i) writePixel(i + poo_x + 1, y + poo_y, c);
 
         if (i)  // skip for first drawn value
@@ -934,54 +762,21 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
         }
         prev_y = y;
         */
-
-        // TODO if using different colors for the graphs y values along the x axis, then colors in the same column differ slightly
-        // but not noticable with smooth gradients ;)
        
+        // this is sufficient if we (and even better than smoothing) in area-graph-mode
         fillRect(i + poo_x + 1, poo_y + 1, 1, y - 1, c);//WHITE);
 
         //writePixel(i + poo_x + 1, y + poo_y, color);
 
-        //uint16_t y_ceil = ceilf(y);
-        //uint16_t y_floor = floorf(y);
-        //if (i %  (int16_t)ceilf(((float)pixel_number / 63)) == 0) color = color_increase(color);
-        //if (i %  (int16_t)ceilf(((float)pixel_number / 94)) == 0) c = color_increase(c);
-        //color += 100;
-        //printf("color: 0x%04x\n", color);
-        //writePixel(i + poo_x + 1, y_floor + poo_y, color);
-        //writePixel(i + poo_x + 1, y_ceil + 1 + poo_y, color);
-        //writePixel(i + poo_x + 1, y_floor - 1 + poo_y, color);
-        //writePixel(i + poo_x + 1, y_ceil + 2 + poo_y, color);
-        //writePixel(i + poo_x + 1, y_floor - 2 + poo_y, color);
-     //   writePixel(i + poo_x + 1, y_ceil + 3 + poo_y, color);
-      //  writePixel(i + poo_x + 1, y_floor - 3 + poo_y, color);
     }
     
     // draw x axis again because very low values can be drawn onto the x axis
     // if the axis is a different color this becomes visible as a gap we don't want
     // TODO fix?
     fillRect(poo_x, poo_y, len_x, 1, color);//WHITE);
-
-    /* old, naive graph drawing; only plot the sensor values
-    for (int i = 0; i < len_x; i++)
-    {
-        float rel_pos = (float) (get_val_func((start_index + i) % GRAPH_BUF_LEN) - val_min) / 
-                                    val_range;
-        float y = rel_pos * len_y;
-        uint16_t y_ceil = ceilf(y);
-        uint16_t y_floor = floorf(y);
-        writePixel(i + poo_x + 1, y_ceil + poo_y, color);
-        writePixel(i + poo_x + 1, y_floor + poo_y, color);
-        //writePixel(i + poo_x + 1, y_ceil + 1 + poo_y, color);
-        //writePixel(i + poo_x + 1, y_floor - 1 + poo_y, color);
-        //writePixel(i + poo_x + 1, y_ceil + 2 + poo_y, color);
-        //writePixel(i + poo_x + 1, y_floor - 2 + poo_y, color);
-     //   writePixel(i + poo_x + 1, y_ceil + 3 + poo_y, color);
-      //  writePixel(i + poo_x + 1, y_floor - 3 + poo_y, color);
-    }
-    */
 }
 
+// init the spidev interface for communicating with the SPI driver
 int init_spidev(char *name)
 {
     fd = open(name, O_RDWR);
@@ -1020,6 +815,7 @@ int init_spidev(char *name)
     */
 }
 
+// init GPIOs that we use for chip select and Data/Control line
 int init_gpio()
 {
     // to control GPIO Pins
@@ -1055,15 +851,18 @@ void ili9341_reset()
        delay(200);
     }
 }
+
 void status()
 {
     uint8_t cmd = ILI9341_RDMODE;// 0x0A     ///< Read Display Power Mode
     uint8_t res = readcommand8(cmd);//, uint8_t index) {
     printf("sent: 0x%02x rcv: 0x%02x\n", cmd, res);
 }
+
 void init_displays()
 {
     // initialize two displays at once
+    // both connected over the same SPI bus
     ili9341_reset();
     TEST_SPI_CS_LOW();
     TEST_SPI_CS2_LOW();
@@ -1080,6 +879,7 @@ void init_displays()
     TEST_SPI_CS2_HIGH();
 }
 
+// init inotify for monitoring sensor logfile
 void init_inotify()
 {
     fd_inotify = inotify_init();
@@ -1091,20 +891,14 @@ void init_inotify()
     wd_inotify = inotify_add_watch(fd_inotify, LOG_FILE, IN_MODIFY);
 }
 
-/*  create our desired screen drawings
+/*  our main drawing function
+    set up the screen layout here
     flag_update: only redraw dynamic content */
 void screen_draw(uint8_t flag_update)
 {
     // start drawing on the displays
     uint16_t fg_color = ILI9341_GREEN;
     uint16_t bg_color = ILI9341_BLACK;
-
-    // TODO:
-    // augment drawGraph with a flag for drawing (COMPLETE, UPDATE)
-    // if UPDATE: let drawGraph figure out if max/min values have 
-    // changed for each graph
-    // if not: blacken only the graph area and redraw graph
-    // if yes: blacken the graph area and the y markings area and redraw both
 
     TEST_SPI_CS_LOW();
 
@@ -1142,16 +936,12 @@ void screen_draw(uint8_t flag_update)
     TEST_SPI_CS2_HIGH();
     //endWrite2();
 }
+
 /*  monitor data log file for changes,
     read in the new dataset(s) and redraw graph
-    if new dataset of relevant time frame came in */
+    if a new dataset of relevant time frame came in */
 void update()
 {
-    /*
-    sleep(5);
-    init_data_from_file();
-    screen_draw(1);
-    */
     uint32_t length;
     char buffer[EVENT_BUF_LEN];
     uint32_t i = 0;
@@ -1167,8 +957,10 @@ void update()
         struct inotify_event *event = (struct inotify_event*) &buffer[i];
         if (event->mask & IN_MODIFY) 
         {
+            /*
             printf("File %s modified.\n", event->name);
             printf("event len: %d\n", event->len);
+            */
     
             uint64_t tmp = rb_write_index;
             // read new data from file and redraw graph
@@ -1197,9 +989,6 @@ int main(int argc, char **argv)
 
     init_displays();
 
-    //TODO augment drawGraph() with an update mode that only redraws coordinate system
-    //     if the graphs min or max value has changed
-    
     screen_draw(0);
 
     init_inotify();
@@ -1210,6 +999,8 @@ int main(int argc, char **argv)
         update();
     }
     
+    // this seems useless now ;)
+    // TODO implement cleanup function when program gets killed
     inotify_rm_watch(fd_inotify, wd_inotify);
     close(fd_inotify);
     bcm2835_close();
