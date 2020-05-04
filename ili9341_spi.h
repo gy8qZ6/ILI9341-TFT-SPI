@@ -1,4 +1,10 @@
 /*!
+ * Written by: Cornelius Radicke
+ * 
+ * This library is inspired by and may contain code from the
+ * Adafruit ILI9341 library, so I'm including their header here:
+ *
+ *******************************************************************************
  * @file Adafruit_ILI9341.h
  *
  * This is the documentation for Adafruit's ILI9341 driver for the
@@ -33,8 +39,8 @@
  *
  */
 
-#ifndef _ADAFRUIT_ILI9341H_
-#define _ADAFRUIT_ILI9341H_
+#ifndef ILI9341_SPI_H
+#define ILI9341_SPI_H
 
 /*
 #include "Adafruit_GFX.h"
@@ -127,35 +133,52 @@
 #define ILI9341_GREENYELLOW 0xAFE5 ///< 173, 255,  41
 #define ILI9341_PINK 0xFC18        ///< 255, 130, 198
 
-/**************************************************************************/
-/*!
-@brief Class to manage hardware interface with ILI9341 chipset (also seems to
-work with ILI9340)
-*/
-/**************************************************************************/
-/*
-class Adafruit_ILI9341 : public Adafruit_SPITFT {
-public:
-  Adafruit_ILI9341(int8_t _CS, int8_t _DC, int8_t _MOSI, int8_t _SCLK,
-                   int8_t _RST = -1, int8_t _MISO = -1);
-  Adafruit_ILI9341(int8_t _CS, int8_t _DC, int8_t _RST = -1);
-#if !defined(ESP8266)
-  Adafruit_ILI9341(SPIClass *spiClass, int8_t dc, int8_t cs = -1,
-                   int8_t rst = -1);
-#endif // end !ESP8266
-  Adafruit_ILI9341(tftBusWidth busWidth, int8_t d0, int8_t wr, int8_t dc,
-                   int8_t cs = -1, int8_t rst = -1, int8_t rd = -1);
 
-  void begin(uint32_t freq = 0);
-  void setRotation(uint8_t r);
-  void invertDisplay(bool i);
-  void scrollTo(uint16_t y);
-  void setScrollMargins(uint16_t top, uint16_t bottom);
+/********************* Public functions ***************************************/
 
-  // Transaction API not used by GFX
-  void setAddrWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+// init library
+void ili9341_spi_init(uint16_t width, uint16_t height, uint8_t dc_pin, 
+                        uint8_t rst_pin, char *spidev);
+// initialize ILI9341 Display
+void begin();
+// do a hardware reset
+void ili9341_reset();
+// retrieve status from Display
+void status();
+// draw a filled rectangle
+void fillRect(int16_t x, int16_t y, uint16_t width, uint16_t height, 
+                uint16_t color);
+// invert the colors of the whole display
+void invert(uint8_t mode);
+// draw an ASCII char on the display
+void drawChar(int16_t x, int16_t y, unsigned char c,
+                          uint16_t color, uint16_t bg, uint8_t size_x,
+                          uint8_t size_y);
+// control one pixel
+void writePixel(int16_t x, int16_t y, uint16_t color);
 
-  uint8_t readcommand8(uint8_t reg, uint8_t index = 0);
-};
-*/
-#endif // _ADAFRUIT_ILI9341H_
+
+/********************* Private functions **************************************/
+
+// send command + optional arguments to ILI9341
+static int sendCommand(uint8_t cmd, const uint8_t *addr, uint8_t numArgs);
+// send a command to ILI9341 that receives a 1Byte answer
+static uint8_t readcommand8(uint8_t commandByte);
+// send 1 Byte to ILI9341
+static void SPI_WRITE8(uint8_t value);
+// send 2 Bytes to ILI9341
+static void SPI_WRITE16(uint16_t value);
+// send 1Byte command to ILI9341
+static void writeCommand(uint8_t cmd);
+// set up a pixel drawing area on the display
+static void setAddrWindow(uint16_t x1, uint16_t y1, uint16_t w,
+                                     uint16_t h);
+// color pixels that where defined by setAddrWindow() before
+static int writeColor(uint16_t color, uint32_t len);
+// init the spidev interface for communicating with the SPI driver
+static int init_spidev(char *name);
+// init GPIOs that we use for Reset and Data/Control line
+// chip select are handled in user program
+static int init_gpio();
+
+#endif // ILI9341_SPI_H

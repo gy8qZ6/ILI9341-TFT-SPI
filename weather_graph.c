@@ -14,14 +14,10 @@
 #include <errno.h>
 
 #include <bcm2835.h>
-#include "Adafruit_ILI9341.h"
-#include "glcdfont.c"
+#include "ili9341_spi.h"
 
 #include <math.h>
-
 #include <sys/inotify.h>
-
-#include "test.h"
 
 /*
 amount of time between each pixel on the x axis
@@ -34,6 +30,13 @@ the timestamp (0 - 60) by this value
     30: 2 per hour
    >59: 1 per hour
 */
+
+// manage chip select pins from outside the library
+#define CS_LOW() bcm2835_gpio_write(cs_pin, LOW)
+#define CS_HIGH() bcm2835_gpio_write(cs_pin, HIGH)
+#define CS2_LOW() bcm2835_gpio_write(cs2_pin, LOW)
+#define CS2_HIGH() bcm2835_gpio_write(cs2_pin, HIGH)
+
 #define DATA_INTERVAL_MINUTES 15 
 #define GRAPH_XAXIS_MARK_INTERVAL 12*60 // 12hours
 
@@ -46,6 +49,44 @@ the timestamp (0 - 60) by this value
 #define EVENT_BUF_LEN     ( 1024 * ( EVENT_SIZE + 16 ) )
 
 
+//static uint16_t width, height;
+#define TFT_HEIGHT 240
+#define TFT_WIDTH 320
+
+static uint8_t dc_pin = RPI_V2_GPIO_P1_22;
+static uint8_t rst_pin = RPI_V2_GPIO_P1_18;
+static uint8_t cs2_pin = RPI_V2_GPIO_P1_16;
+static uint8_t cs_pin = RPI_V2_GPIO_P1_13;
+
+static int fd_inotify;
+static int wd_inotify;
+static uint64_t logfile_pos = 0;
+
+// ringbuffer for sensor values
+// one ringbuffer element stores sensor value for all three types
+// NOTE: we don't store the timestamp from the logfile in the ringbuffer
+struct sensor_vals {
+    // all sensor values in integers * 100 instead of floats
+    uint16_t temp;
+    uint16_t hum;
+    uint32_t press;
+};
+static struct sensor_vals *values;
+static uint16_t rb_read_index = 0, rb_write_index = 0;
+
+// functions to retrieve sensor values from ringbuffer element
+uint32_t get_temp(uint16_t index)
+{
+    return values[index].temp;
+}
+uint32_t get_press(uint16_t index)
+{
+    return values[index].press;
+}
+uint32_t get_hum(uint16_t index)
+{
+    return values[index].hum;
+}
 // holds configuration values for function drawGraph
 struct graph_config
 {
@@ -57,7 +98,7 @@ struct graph_config
     uint32_t (*get_val_func)(uint16_t); // function pointer to either get T,P, or H sensor values
                                         // from the ringbuffer
 };
-struct graph_config temp = {
+static struct graph_config temp = {
     .type = 'T',
     .min = -1,
     .max = 0,
@@ -65,7 +106,7 @@ struct graph_config temp = {
     .mark_small = 50,
     .get_val_func = &get_temp
 };   
-struct graph_config pres = {
+static struct graph_config pres = {
     .type = 'P',
     .min = -1,
     .max = 0,
@@ -73,7 +114,7 @@ struct graph_config pres = {
     .mark_small = 50,
     .get_val_func = &get_press
 };   
-struct graph_config hum = {
+static struct graph_config hum = {
     .type = 'H',
     .min = -1,
     .max = 0,
@@ -81,28 +122,6 @@ struct graph_config hum = {
     .mark_small = 250,
     .get_val_func = &get_hum
 };   
-
-uint16_t _width, _height;
-uint8_t dc_pin = RPI_V2_GPIO_P1_22;
-uint8_t cs2_pin = RPI_V2_GPIO_P1_16;
-uint8_t cs_pin = RPI_V2_GPIO_P1_13;
-uint8_t rst_pin = RPI_V2_GPIO_P1_18;
-int fd;
-int fd_inotify;
-int wd_inotify;
-uint64_t logfile_pos = 0;
-
-// ringbuffer for sensor values
-// one ringbuffer element stores sensor value for all three types
-// NOTE: we don't store the timestamp from the logfile in the ringbuffer
-struct sensor_vals {
-    // all sensor values in integers * 100 instead of floats
-    uint16_t temp;
-    uint16_t hum;
-    uint32_t press;
-};
-struct sensor_vals *values;
-uint16_t rb_read_index = 0, rb_write_index = 0;
 
 // have some fun with graph drawing
 // make a color gradient over the entire graph
@@ -261,282 +280,13 @@ int init_data_from_file()
     fclose(f);
 }
 
-// initialization commands for ILI9341 Display
-static const uint8_t initcmd[] = {
-  0xEF, 3, 0x03, 0x80, 0x02,
-  0xCF, 3, 0x00, 0xC1, 0x30,
-  0xED, 4, 0x64, 0x03, 0x12, 0x81,
-  0xE8, 3, 0x85, 0x00, 0x78,
-  0xCB, 5, 0x39, 0x2C, 0x00, 0x34, 0x02,
-  0xF7, 1, 0x20,
-  0xEA, 2, 0x00, 0x00,
-  ILI9341_PWCTR1  , 1, 0x23,             // Power control VRH[5:0]
-  ILI9341_PWCTR2  , 1, 0x10,             // Power control SAP[2:0];BT[3:0]
-  ILI9341_VMCTR1  , 2, 0x3e, 0x28,       // VCM control
-  ILI9341_VMCTR2  , 1, 0x86,             // VCM control2
-  ILI9341_MADCTL  , 1, 0x48,             // Memory Access Control
-  ILI9341_VSCRSADD, 1, 0x00,             // Vertical scroll zero
-  ILI9341_PIXFMT  , 1, 0x55,
-  ILI9341_FRMCTR1 , 2, 0x00, 0x18,
-  ILI9341_DFUNCTR , 3, 0x08, 0x82, 0x27, // Display Function Control
-  0xF2, 1, 0x00,                         // 3Gamma Function Disable
-  ILI9341_GAMMASET , 1, 0x01,             // Gamma curve selected
-  ILI9341_GMCTRP1 , 15, 0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, // Set Gamma
-    0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E, 0x09, 0x00,
-  ILI9341_GMCTRN1 , 15, 0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, // Set Gamma
-    0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F,
-  ILI9341_SLPOUT  , 0x80,                // Exit Sleep
-  ILI9341_DISPON  , 0x80,                // Display on
-  0x00                                   // End of list
-};
-
-// send command + optional arguments to ILI9341
-// TODO use write and read operations instead of ioctl
-//      because we are not using the advanced functionality here
-int sendCommand(uint8_t cmd, const uint8_t *addr, uint8_t numArgs)
-{
-    struct spi_ioc_transfer xfer[1];
-    memset(xfer, 0, sizeof xfer);
-    xfer[0].tx_buf = (unsigned long)&cmd;
-    xfer[0].len = 1;
-    //xfer[0].cs_change = 0;
-	//bcm2835_gpio_write(cs_pin, LOW);
-
-    // send command with activated Data/Control bit
-	bcm2835_gpio_write(dc_pin, LOW);
-    uint8_t status = ioctl(fd, SPI_IOC_MESSAGE(1), xfer);
-    if (status < 0) {
-        printf("error\n");
-        perror("SPI_IOC_MESSAGE");
-        //bcm2835_close();
-        return 1;
-    }
-	bcm2835_gpio_write(dc_pin, HIGH);
-
-    // send Command Arguments if we have any
-    if (numArgs)
-    {
-        xfer[0].tx_buf = (unsigned long) addr;
-        xfer[0].len = numArgs;
-        //xfer[1].cs_change = 0;
-
-        status = ioctl(fd, SPI_IOC_MESSAGE(1), xfer);
-        if (status < 0) {
-            printf("error\n");
-            perror("SPI_IOC_MESSAGE");
-            //bcm2835_close();
-            return 1;
-        }
-    }
-	//bcm2835_gpio_write(cs_pin, HIGH);
-}
-
-// initialize ILI9341 Display
-void begin()
-{
-  uint8_t cmd, x, numArgs;
-  const uint8_t *addr = initcmd;
-  while ((cmd = *addr++) > 0) {
-    x = *addr++;
-    numArgs = x & 0x7F;
-    //printf("sendCommand 0x%02x 0x%02x 0x%02x\n", cmd, addr, numArgs);
-    sendCommand(cmd, addr, numArgs);
-    addr += numArgs;
-    if (x & 0x80)
-      delay(150);
-  }
-
-  _width = ILI9341_TFTWIDTH;
-  _height = ILI9341_TFTHEIGHT;
-}
-
-// -----------------------
-#define TEST_SPI_CS_LOW() bcm2835_gpio_write(cs_pin, LOW)
-#define TEST_SPI_CS_HIGH() bcm2835_gpio_write(cs_pin, HIGH)
-
-#define TEST_SPI_CS2_LOW() bcm2835_gpio_write(cs2_pin, LOW)
-#define TEST_SPI_CS2_HIGH() bcm2835_gpio_write(cs2_pin, HIGH)
-
-#define TEST_SPI_DC_LOW() bcm2835_gpio_write(dc_pin, LOW)// Command mode
-#define TEST_SPI_DC_HIGH() bcm2835_gpio_write(dc_pin, HIGH)// Data mode
-
-#define TEST_RST_LOW() bcm2835_gpio_write(rst_pin, LOW)
-#define TEST_RST_HIGH() bcm2835_gpio_write(rst_pin, HIGH)
-
-// send a command to ILI9341 that receives a 1Byte answer
-uint8_t readcommand8(uint8_t commandByte)//, uint8_t index) {
-{
-  uint8_t result;
-
-  TEST_SPI_DC_LOW(); // Command mode
-  write(fd, &commandByte, 1);
-  TEST_SPI_DC_HIGH(); // Data mode
-
-  read(fd, &result, 1);
-  return result;
-}
-
-// send 1 Byte to ILI9341
-void SPI_WRITE8(uint8_t value)
-{
-    write(fd, &value, 1);
-}
-
-// send 2 Bytes to ILI9341
-void SPI_WRITE16(uint16_t value)
-{
-    uint8_t msb = value >> 8; 
-    uint8_t lsb = (uint8_t)value; 
-    write(fd, &msb, 1);
-    write(fd, &lsb, 1);
-}
-
-// send 1Byte command to ILI9341
-void writeCommand(uint8_t cmd)
-{
-    TEST_SPI_DC_LOW();
-    SPI_WRITE8(cmd);
-    TEST_SPI_DC_HIGH();
-}
-    
-// set up a pixel drawing area on the display
-void setAddrWindow(uint16_t x1, uint16_t y1, uint16_t w,
-                                     uint16_t h) {
-  uint16_t x2 = (x1 + w - 1), y2 = (y1 + h - 1);
-  writeCommand(ILI9341_PASET); // Row address set
-  SPI_WRITE16(x1);
-  SPI_WRITE16(x2);
-  writeCommand(ILI9341_CASET); // Column address set
-  SPI_WRITE16(y1);
-  SPI_WRITE16(y2);
-  writeCommand(ILI9341_RAMWR); // Write to RAM
-}
-
-// control one pixel
-void writePixel(int16_t x, int16_t y, uint16_t color) {
-  if ((x >= 0) && (x < _width) && (y >= 0) && (y < _height)) {
-    setAddrWindow(x, y, 1, 1);
-    SPI_WRITE16(color);
-  }
-}
-
-// color pixels that where defined by setAddrWindow() before
-// we have to send the color value for each pixel individually
-// that means we just send the same color value repeatedly here
-// if we want to color an area
-int writeColor(uint16_t color, uint32_t len) 
-{
-    if (!len)
-        return 0; // Avoid 0-byte transfers
-
-    // max buf len per ioctl call is 2048
-    int max_len = 2048;
-
-    uint8_t hi = color >> 8, lo = color;
-    uint8_t *buf;//[len*2];
-    buf = (uint8_t*)malloc(max_len*2);
-    for (int i =0; i<max_len;i++)
-    {
-        buf[2*i] = hi;
-        buf[2*i+1] = lo;
-    }
-
-    int iterations = len / max_len;
-    while (iterations--) {
-        write(fd, buf, max_len*2);
-    }
-    write(fd, buf, (len % max_len)*2);
-
-    free(buf);
-}
-
-// draw a filled rectangle
-void fillRect(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t color)
-{
-  if ((x >= 0) && (x < _width) && (y >= 0) && (y < _height)) {
-    if ((x + width <= _width) && (y + height <= _height)) {
-        setAddrWindow(x, y, width, height);
-        writeColor(color, (uint32_t)width*height);
-    }
-  }
-}
-
-// invert the colors of the whole display
-void invert(uint8_t mode)
-{
-    TEST_SPI_DC_LOW();
-    if (mode)
-    {
-        SPI_WRITE8(ILI9341_INVON);
-    } else
-    {
-        SPI_WRITE8(ILI9341_INVOFF);
-    }
-    TEST_SPI_DC_HIGH();
-}
-
-// draw an ASCII char on the display
-void drawChar(int16_t x, int16_t y, unsigned char c,
-                          uint16_t color, uint16_t bg, uint8_t size_x,
-                          uint8_t size_y) {
-
-  if ((x >= _width) ||              // Clip right
-      (y >= _height) ||             // Clip bottom
-      ((x + 6 * size_x - 1) < 0) || // Clip left
-      ((y + 8 * size_y - 1) < 0))   // Clip top
-    return;
-
-  //if (!_cp437 && (c >= 176))
-  if (c >= 176)
-    c++; // Handle 'classic' charset behavior
-
-  for (int8_t i = 0; i < 5; i++) { // Char bitmap = 5 columns
-    uint8_t line = font[c * 5 + i];//pgm_read_byte(&font[c * 5 + i]);
-    for (int8_t j = 7; j >= 0; j--, line >>= 1) {
-      if (line & 1) {
-        if (size_x == 1 && size_y == 1)
-          writePixel(x + i, y + j, color);
-        else
-          fillRect(x + i * size_x, y + j * size_y, size_x, size_y,
-                        color);
-      } else if (bg != color) {
-        if (size_x == 1 && size_y == 1)
-          writePixel(x + i, y + j, bg);
-        else
-          fillRect(x + i * size_x, y + j * size_y, size_x, size_y, bg);
-      }
-    }
-  }
-  if (bg != color) { // If opaque, draw vertical line for last column
-    if (size_x == 1 && size_y == 1)
-      //writeFastVLine(x + 5, y, 8, bg);
-      fillRect(x + 5, y, 1, 8, bg);
-      
-    else
-      fillRect(x + 5 * size_x, y, size_x, 8 * size_y, bg);
-  }
-}
-
-// functions to retrieve sensor values from ringbuffer element
-uint32_t get_temp(uint16_t index)
-{
-    return values[index].temp;
-}
-uint32_t get_press(uint16_t index)
-{
-    return values[index].press;
-}
-uint32_t get_hum(uint16_t index)
-{
-    return values[index].hum;
-}
 
 /* draw both axis and graph for one sensor value */
 void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
                struct graph_config* gc, uint16_t color, uint8_t flag_update)
 {
-    if ((x < 0 || x + width > _width) ||
-        (y < 0 || y + height > _height))
+    if ((x < 0 || x + width > TFT_WIDTH) ||
+        (y < 0 || y + height > TFT_HEIGHT))
     {
         printf("graph would be out of bounds, aborting");
         return;
@@ -776,107 +526,25 @@ void drawGraph(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
     fillRect(poo_x, poo_y, len_x, 1, color);//WHITE);
 }
 
-// init the spidev interface for communicating with the SPI driver
-int init_spidev(char *name)
-{
-    fd = open(name, O_RDWR);
-    if (fd < 0) {
-        perror("open");
-        printf("error opening spidev\n");
-        exit(1);
-    }
-
-    uint32_t spi_speed = 50000000;        //1000000 = 1MHz (1uS per bit) 
-    uint8_t status_value;
-
-    status_value = ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed);
-    if(status_value < 0)
-    {
-        perror("Could not set SPI speed (WR)...ioctl fail");
-        exit(1);
-    }
-
-    status_value = ioctl(fd, SPI_IOC_RD_MAX_SPEED_HZ, &spi_speed);
-    if(status_value < 0)
-    {
-        perror("Could not set SPI speed (RD)...ioctl fail");
-        exit(1);
-    }
-
-    return 0;
-    /*
-    // TODO: check this again: has no effect:
-    // send byte WITHOUT CHANGING CHIPSELECT
-    uint8_t mode = SPI_MODE_0 | SPI_NO_CS;
-    if (ioctl(fd, SPI_IOC_WR_MODE, &mode)<0)
-    {
-        printf("error setting mode\n");
-    }
-    */
-}
-
-// init GPIOs that we use for chip select and Data/Control line
-int init_gpio()
-{
-    // to control GPIO Pins
-    if (!bcm2835_init()) {
-      printf("error bcm2835_init()\n");
-      fflush(stdout);
-      return 1;
-    }
-
-    // Set the pin to be an output
-    bcm2835_gpio_fsel(dc_pin, BCM2835_GPIO_FSEL_OUTP);
-    bcm2835_gpio_fsel(cs_pin, BCM2835_GPIO_FSEL_OUTP);
-    bcm2835_gpio_fsel(cs2_pin, BCM2835_GPIO_FSEL_OUTP);
-    bcm2835_gpio_fsel(rst_pin, BCM2835_GPIO_FSEL_OUTP);
-	bcm2835_gpio_write(cs_pin, HIGH);
-	bcm2835_gpio_write(cs2_pin, HIGH);
-	bcm2835_gpio_write(dc_pin, HIGH);
-}
-
-void ili9341_reset()
-{
-    if (rst_pin >= 0) {
-       // Toggle _rst low to reset
-       //pinMode(rst_pin, OUTPUT);
-       //digitalWrite(rst_pin, HIGH);
-       TEST_RST_HIGH();
-       delay(100);
-       //digitalWrite(rst_pin, LOW);
-       TEST_RST_LOW();
-       delay(100);
-       //digitalWrite(rst_pin, HIGH);
-       TEST_RST_HIGH();
-       delay(200);
-    }
-}
-
-void status()
-{
-    uint8_t cmd = ILI9341_RDMODE;// 0x0A     ///< Read Display Power Mode
-    uint8_t res = readcommand8(cmd);//, uint8_t index) {
-    printf("sent: 0x%02x rcv: 0x%02x\n", cmd, res);
-}
 
 void init_displays()
 {
     // initialize two displays at once
     // both connected over the same SPI bus
     ili9341_reset();
-    TEST_SPI_CS_LOW();
-    TEST_SPI_CS2_LOW();
+    CS_LOW();
+    CS2_LOW();
     begin();
-    TEST_SPI_CS_HIGH();
-    TEST_SPI_CS2_HIGH();
+    CS_HIGH();
+    CS2_HIGH();
 
     // do a status test for each display
-    TEST_SPI_CS_LOW();
+    CS_LOW();
     status();
-    TEST_SPI_CS_HIGH();
-    TEST_SPI_CS2_LOW();
+    CS_HIGH();
+    CS2_LOW();
     status();
-    TEST_SPI_CS2_HIGH();
+    CS2_HIGH();
 }
 
 // init inotify for monitoring sensor logfile
@@ -900,11 +568,11 @@ void screen_draw(uint8_t flag_update)
     uint16_t fg_color = ILI9341_GREEN;
     uint16_t bg_color = ILI9341_BLACK;
 
-    TEST_SPI_CS_LOW();
+    CS_LOW();
 
     if (!flag_update)
     {
-        fillRect(0,0,ILI9341_TFTWIDTH,ILI9341_TFTHEIGHT, bg_color);
+        fillRect(0,0,TFT_WIDTH,TFT_HEIGHT, bg_color);
     }
     //drawGraph(0, 0, _width, _height);
     /*
@@ -919,21 +587,21 @@ void screen_draw(uint8_t flag_update)
     //drawGraph(0, 0, _width/2, _height/2-1, 'T', ILI9341_RED);
     */
    // drawGraph(0, _height/2-1, _width, _height/2, 'H', ILI9341_CYAN);//BLUE);
-    drawGraph(0, _height/2, _width, _height/2, &hum, fg_color, flag_update);//CYAN);//GREEN);
-    drawGraph(0, 0, _width, _height/2, &temp, fg_color, flag_update);//MAGENTA);//RED);
+    drawGraph(0, TFT_HEIGHT/2, TFT_WIDTH, TFT_HEIGHT/2, &hum, fg_color, flag_update);//CYAN);//GREEN);
+    drawGraph(0, 0, TFT_WIDTH, TFT_HEIGHT/2, &temp, fg_color, flag_update);//MAGENTA);//RED);
     //drawGraph(0, _height/2-1, _width/2, _height/2);
 
-    TEST_SPI_CS_HIGH();
+    CS_HIGH();
 
-    TEST_SPI_CS2_LOW();
+    CS2_LOW();
     //startWrite2();
     if (!flag_update)
     {
-        fillRect(0,0,ILI9341_TFTWIDTH,ILI9341_TFTHEIGHT, bg_color);
+        fillRect(0,0,TFT_WIDTH,TFT_HEIGHT, bg_color);
     }
     //drawGraph(0, _height/2-1, _width, _height/2, 'P', ILI9341_ORANGE);//BLUE);
-    drawGraph(0, 0, _width, _height, &pres, fg_color, flag_update);//ORANGE);//BLUE);
-    TEST_SPI_CS2_HIGH();
+    drawGraph(0, 0, TFT_WIDTH, TFT_HEIGHT, &pres, fg_color, flag_update);//ORANGE);//BLUE);
+    CS2_HIGH();
     //endWrite2();
 }
 
@@ -980,9 +648,22 @@ int main(int argc, char **argv)
     char *name = argv[1];
     unsigned char buf[32], *bp;
 
+    ili9341_spi_init(320, 240, dc_pin, rst_pin, name);
     // initialize hardware
-    init_spidev(name);
-    init_gpio();
+
+    /*
+    // bcm2835_init is called by init_gpio() above
+    // init chip select pins
+    if (!bcm2835_init()) {
+      printf("error bcm2835_init()\n");
+      fflush(stdout);
+      return 1;
+    }
+    */
+    bcm2835_gpio_fsel(cs_pin, BCM2835_GPIO_FSEL_OUTP);
+    bcm2835_gpio_fsel(cs2_pin, BCM2835_GPIO_FSEL_OUTP);
+	bcm2835_gpio_write(cs_pin, HIGH);
+	bcm2835_gpio_write(cs2_pin, HIGH);
 
     // initialize sensor data
     init_data_from_file();
